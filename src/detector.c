@@ -23,12 +23,38 @@ int check_mistakes = 0;
 
 static int coco_ids[] = { 1,2,3,4,5,6,7,8,9,10,11,13,14,15,16,17,18,19,20,21,22,23,24,25,27,28,31,32,33,34,35,36,37,38,39,40,41,42,43,44,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64,65,67,70,72,73,74,75,76,77,78,79,80,81,82,84,85,86,87,88,89,90 };
 
-void train_detector(char *datacfg, char *cfgfile, char *weightfile, int *gpus, int ngpus, int clear, int dont_show, int calc_map, float thresh, float iou_thresh, int mjpeg_port, int show_imgs, int benchmark_layers, char* chart_path)
+// Acquire when running detached training.
+static pthread_mutex_t g_train_lock;
+
+// Set to true to stop detached training. Also affects blocking training, and is always unset by the detached trainer.
+static volatile bool g_finish_training_prematurely = false;
+
+typedef struct _worker_ctx
+{
+    char *datacfg;
+    char *cfgfile;
+    char *weightfile;
+    int *gpus;
+    int ngpus;
+    int clear;
+    int dont_show;
+    int calc_map;
+    float thresh;
+    float iou_thresh;
+    int mjpeg_port;
+    int show_imgs;
+    int benchmark_layers;
+} worker_ctx;
+
+void train_detector(char *datacfg, char *cfgfile, char *weightfile, int *gpus, int ngpus, int clear, int dont_show, int calc_map, float thresh, float iou_thresh, int mjpeg_port, int show_imgs, int benchmark_layers)
 {
     list *options = read_data_cfg(datacfg);
     char *train_images = option_find_str(options, "train", "data/train.txt");
     char *valid_images = option_find_str(options, "valid", train_images);
+    char *chart_path = option_find_str(options, "chart", "chart.png");
+    char *log = option_find_str(options, "log", NULL);
     char *backup_directory = option_find_str(options, "backup", "/backup/");
+    FILE *log_file = NULL;
 
     network net_map;
     if (calc_map) {
@@ -190,8 +216,10 @@ void train_detector(char *datacfg, char *cfgfile, char *weightfile, int *gpus, i
     int count = 0;
     double time_remaining, avg_time = -1, alpha_time = 0.01;
 
+    bool checked_log = false;
+
     //while(i*imgs < N*120){
-    while (get_current_iteration(net) < net.max_batches) {
+    while (get_current_iteration(net) < net.max_batches && !g_finish_training_prematurely) {
         if (l.random && count++ % 10 == 0) {
             float rand_coef = 1.4;
             if (l.random != 1.0) rand_coef = l.random;
@@ -316,6 +344,38 @@ void train_detector(char *datacfg, char *cfgfile, char *weightfile, int *gpus, i
         printf("\n %d: %f, %f avg loss, %f rate, %lf seconds, %d images, %f hours left\n", iteration, loss, avg_loss, get_current_rate(net), (what_time_is_it_now() - time), iteration*imgs, avg_time);
         fflush(stdout);
 
+        if (log && !checked_log) // Where log is to be NULL (not specified) for no logging
+        {
+            // Check if the file exists so we can know whether or not to add identifying information;
+            // note this assumes that the file is not empty.
+            log_file = fopen(log, "r");
+            const bool file_exists = log_file;
+
+            if (log_file)
+                fclose(log_file);
+
+            log_file = fopen(log, "a");
+
+            if (log_file)
+            {
+                if (!file_exists)
+                    fprintf(log_file, "Iteration,avg. loss,MAP\n");
+            }
+            else
+            {
+                fprintf(stderr, "Failed to create new log file with name %s\n", log);
+                fflush(stderr);
+            }
+
+            checked_log = true;
+        }
+
+        if (log_file) //iteration, avg. loss, map
+        {
+            fprintf(log_file, "%d,%f,%f\n", iteration, avg_loss, mean_average_precision);
+            fflush(log_file);
+        }
+
         int draw_precision = 0;
         if (calc_map && (iteration >= next_map_calc || iteration == net.max_batches)) {
             if (l.random) {
@@ -377,7 +437,7 @@ void train_detector(char *datacfg, char *cfgfile, char *weightfile, int *gpus, i
             if (cur_con_acc >= 0) avg_contrastive_acc = avg_contrastive_acc*0.99 + cur_con_acc * 0.01;
             printf("  avg_contrastive_acc = %f \n", avg_contrastive_acc);
         }
-        draw_train_loss(windows_name, img, img_size, avg_loss, max_img_loss, iteration, net.max_batches, mean_average_precision, draw_precision, "mAP%", avg_contrastive_acc / 100, dont_show, mjpeg_port, avg_time);
+        draw_train_loss(windows_name, chart_path, img, img_size, avg_loss, max_img_loss, iteration, net.max_batches, mean_average_precision, draw_precision, "mAP%", avg_contrastive_acc / 100, dont_show, mjpeg_port, avg_time);
 #endif    // OPENCV
 
         //if (i % 1000 == 0 || (i < 1000 && i % 100 == 0)) {
@@ -445,6 +505,137 @@ void train_detector(char *datacfg, char *cfgfile, char *weightfile, int *gpus, i
     if (calc_map) {
         net_map.n = 0;
         free_network(net_map);
+    }
+
+    if (log_file)
+        fclose(log_file);
+}
+
+static void *worker_entry(void *erased_ctx)
+{
+    const worker_ctx *const ctx = erased_ctx;
+
+    train_detector(ctx->datacfg, ctx->cfgfile, ctx->weightfile, ctx->gpus, ctx->ngpus,
+        ctx->clear, ctx->dont_show, ctx->calc_map, ctx->thresh, ctx->iou_thresh,
+        ctx->mjpeg_port, ctx->show_imgs, ctx->benchmark_layers);
+
+    // Training finished; free allocated buffers
+    free(ctx->datacfg);
+    free(ctx->cfgfile);
+    free(ctx->weightfile);
+    free(ctx->gpus);
+    free(erased_ctx);
+
+    (void)pthread_mutex_unlock(&g_train_lock);
+    return NULL;
+}
+
+void train_detector_detach(char *datacfg, char *cfgfile, char *weightfile, int *gpus, int ngpus, int clear, int dont_show, int calc_map, float thresh, float iou_thresh, int mjpeg_port, int show_imgs, int benchmark_layers)
+{
+    // Make sure a training session is not already running, and acquire the train lock.
+    // This may race when ending detached training. Make sure detached training is completely finished
+    // before calling this function again.
+    if (pthread_mutex_trylock(&g_train_lock) != 0)
+    {
+        fprintf(stderr, "Error: tried to run two training sessions at once. Skipping.\n");
+        fflush(stderr);
+
+        return;
+    }
+
+    // The nature of this function may be such that all pointers will eventually be freed asynchronously;
+    // to avoid any conflicts, we should copy the given args into our own allocated buffer.
+    // This also means that it is up to the thread itself to eventually free these buffers.
+    const size_t datacfg_len = datacfg ? strlen(datacfg) : 0;
+    const size_t cfgfile_len = cfgfile ? strlen(cfgfile) : 0;
+    const size_t weightfile_len = weightfile ? strlen(weightfile) : 0;
+
+    char *const datacfg_copy = datacfg ? malloc(datacfg_len + 1) : NULL;
+    char *const cfgfile_copy = cfgfile ? malloc(cfgfile_len + 1) : NULL;
+    char *const weightfile_copy = weightfile ? malloc(weightfile_len + 1) : NULL;
+    int *const gpus_copy = gpus ? malloc(ngpus * sizeof(int)) : NULL;
+    worker_ctx *const ctx = malloc(sizeof(worker_ctx));
+
+    if ((datacfg && !datacfg_copy) || (cfgfile && !cfgfile_copy) || (weightfile && !weightfile_copy) || (gpus && !gpus_copy) || !ctx)
+    {
+        fprintf(stderr, "Failed to allocate required buffers.\n");
+        fflush(stderr);
+
+        free(datacfg_copy);
+        free(cfgfile_copy);
+        free(weightfile_copy);
+        free(gpus_copy);
+        free(ctx);
+
+        (void)pthread_mutex_unlock(&g_train_lock);
+        return;
+    }
+
+    if (datacfg_copy)
+        memcpy(datacfg_copy, datacfg, datacfg_len + 1);
+
+    if (cfgfile_copy)
+        memcpy(cfgfile_copy, cfgfile, cfgfile_len + 1);
+
+    if (weightfile_copy)
+        memcpy(weightfile_copy, weightfile, weightfile_len + 1);
+
+    if (gpus_copy)
+        memcpy(gpus_copy, gpus, ngpus * sizeof(int));
+
+    // Create the worker. Its job will be to run training while also listening for the kill signal.
+    pthread_t thread;
+    memset(ctx, 0, sizeof(*ctx));
+
+    ctx->datacfg = datacfg_copy;
+    ctx->cfgfile = cfgfile_copy;
+    ctx->weightfile = weightfile_copy;
+    ctx->gpus = gpus_copy;
+    ctx->ngpus = ngpus;
+    ctx->clear = clear;
+    ctx->dont_show = dont_show;
+    ctx->calc_map = calc_map;
+    ctx->thresh = thresh;
+    ctx->iou_thresh = iou_thresh;
+    ctx->mjpeg_port = mjpeg_port;
+    ctx->show_imgs = show_imgs;
+    ctx->benchmark_layers = benchmark_layers;
+
+    const int error = pthread_create(&thread, NULL, worker_entry, ctx);
+
+    if (error != 0)
+    {
+        fprintf(stderr, "Failed to create worker thread (err %i)\n", error);
+        fflush(stderr);
+
+        (void)pthread_mutex_unlock(&g_train_lock);
+    }
+}
+
+void end_detached_training(void)
+{
+    // !! This assumes the caller is effectively single-threaded !!
+    // Tell the trainer to stop and then wait for the train lock to be unlocked;
+    // when it's unlocked we know that training is finished so we can unset the variable
+    // and unlock the mutex. Here there is a race condition where we hold onto the lock
+    // and so callers of train_detector_detach may think that detached training is still happening.
+    g_finish_training_prematurely = true;
+    (void)pthread_mutex_lock(&g_train_lock);
+    g_finish_training_prematurely = false;
+    (void)pthread_mutex_unlock(&g_train_lock);
+
+    fprintf(stderr, "Detached training successfully stopped.\n");
+    fflush(stderr);
+}
+
+void init_detached_training(void)
+{
+    if (pthread_mutex_init(&g_train_lock, NULL))
+    {
+        fprintf(stderr, "pthread_mutex_init() failed\n");
+        fflush(stderr);
+
+        exit(-1);
     }
 }
 
@@ -1779,6 +1970,7 @@ void draw_object(char *datacfg, char *cfgfile, char *weightfile, char *filename,
 {
     list *options = read_data_cfg(datacfg);
     char *name_list = option_find_str(options, "names", "data/names.list");
+    char *chart_path = option_find_str(options, "chart", "chart.png");
     int names_size = 0;
     char **names = get_labels_custom(name_list, &names_size); //get_labels(name_list);
 
@@ -1866,7 +2058,7 @@ void draw_object(char *datacfg, char *cfgfile, char *weightfile, char *filename,
             forward_backward_network_gpu(net, X, truth_cpu);
 
             float avg_loss = get_network_cost(net);
-            draw_train_loss(windows_name, img, img_size, avg_loss, max_img_loss, iteration, it_num, 0, 0, "mAP%", 0, dont_show, 0, 0);
+            draw_train_loss(windows_name, chart_path, img, img_size, avg_loss, max_img_loss, iteration, it_num, 0, 0, "mAP%", 0, dont_show, 0, 0);
 
             float inv_loss = 1.0 / max_val_cmp(0.01, avg_loss);
             //net.learning_rate = *lr_set * inv_loss;
@@ -1978,7 +2170,6 @@ void run_detector(int argc, char **argv)
     // and for recall mode (extended output table-like format with results for best_class fit)
     int ext_output = find_arg(argc, argv, "-ext_output");
     int save_labels = find_arg(argc, argv, "-save_labels");
-    char* chart_path = find_char_arg(argc, argv, "-chart", 0);
     if (argc < 4) {
         fprintf(stderr, "usage: %s %s [train/test/valid/demo/map] [data] [cfg] [weights (optional)]\n", argv[0], argv[1]);
         return;
@@ -2017,7 +2208,7 @@ void run_detector(int argc, char **argv)
             if (weights[strlen(weights) - 1] == 0x0d) weights[strlen(weights) - 1] = 0;
     char *filename = (argc > 6) ? argv[6] : 0;
     if (0 == strcmp(argv[2], "test")) test_detector(datacfg, cfg, weights, filename, thresh, hier_thresh, dont_show, ext_output, save_labels, outfile, letter_box, benchmark_layers);
-    else if (0 == strcmp(argv[2], "train")) train_detector(datacfg, cfg, weights, gpus, ngpus, clear, dont_show, calc_map, thresh, iou_thresh, mjpeg_port, show_imgs, benchmark_layers, chart_path);
+    else if (0 == strcmp(argv[2], "train")) train_detector(datacfg, cfg, weights, gpus, ngpus, clear, dont_show, calc_map, thresh, iou_thresh, mjpeg_port, show_imgs, benchmark_layers);
     else if (0 == strcmp(argv[2], "valid")) validate_detector(datacfg, cfg, weights, outfile);
     else if (0 == strcmp(argv[2], "recall")) validate_detector_recall(datacfg, cfg, weights);
     else if (0 == strcmp(argv[2], "map")) validate_detector_map(datacfg, cfg, weights, thresh, iou_thresh, map_points, letter_box, NULL);
